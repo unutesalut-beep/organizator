@@ -1,5 +1,5 @@
 // Service worker: păstrează aplicația în cache ca să meargă și fără internet.
-const CACHE = 'organizator-v1';
+const CACHE = 'organizator-v2';
 const FILES = ['./', './index.html', './manifest.json', './icons/icon-180.png', './icons/icon-192.png', './icons/icon-512.png'];
 
 self.addEventListener('install', e => {

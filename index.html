@@ -75,6 +75,21 @@ main{padding:0 16px calc(var(--tab-h) + env(safe-area-inset-bottom) + 90px)}
 .note .b{font-size:13px;color:var(--muted);display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden;white-space:pre-wrap;overflow-wrap:anywhere}
 .note .c{margin-top:8px}
 .search{width:100%;border:0;background:var(--card);color:var(--text);border-radius:10px;padding:10px 12px;font-size:16px;margin-bottom:12px}
+.searchrow{display:flex;gap:10px;align-items:flex-start}
+.searchrow .search{flex:1}
+.micbtn{flex:none;border:0;height:42px;padding:0 14px;border-radius:10px;background:var(--red);color:#fff;font-size:15px;font-weight:600;
+  display:flex;align-items:center;gap:6px;cursor:pointer}
+.micbtn svg{width:18px;height:18px}
+.rec{text-align:center;padding:10px 0 4px}
+.rec .time{font-size:44px;font-weight:300;font-variant-numeric:tabular-nums;margin:6px 0 18px}
+.rec .big{width:84px;height:84px;border-radius:50%;border:5px solid var(--line);background:var(--red);color:#fff;cursor:pointer;
+  display:grid;place-items:center;margin:0 auto}
+.rec .big i{display:block;width:30px;height:30px;border-radius:50%;background:#fff}
+.rec .big.on i{border-radius:6px;width:28px;height:28px}
+.rec .big.on{animation:pulse 1.4s infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(220,38,38,.5)}70%{box-shadow:0 0 0 16px rgba(220,38,38,0)}100%{box-shadow:0 0 0 0 rgba(220,38,38,0)}}
+.live{min-height:48px;margin-top:16px;padding:10px 12px;border-radius:10px;background:var(--card);color:var(--muted);font-size:15px;text-align:left;white-space:pre-wrap}
+audio{width:100%;margin-top:10px}
 /* money */
 .bar{height:8px;border-radius:4px;background:var(--line);overflow:hidden;margin-top:4px}
 .bar i{display:block;height:100%;background:var(--accent);border-radius:4px}
@@ -157,7 +172,10 @@ textarea{min-height:180px;resize:vertical}
 
   <!-- NOTIȚE -->
   <section class="view" id="v-notes">
-    <input class="search" id="noteSearch" type="search" placeholder="Caută în notițe…">
+    <div class="searchrow">
+      <input class="search" id="noteSearch" type="search" placeholder="Caută în notițe…">
+      <button class="micbtn" id="voiceBtn" aria-label="Notă vocală"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v4"/></svg>Vocal</button>
+    </div>
     <div class="notes" id="noteList"></div>
   </section>
 
@@ -406,11 +424,98 @@ function renderTasks() {
     `<div class="empty">${taskFilter === 'done' ? 'Încă nu ai bifat nimic.' : 'Nicio sarcină. Apasă + ca să adaugi.'}</div>`;
 }
 
+/* ---------- AUDIO (stocat în IndexedDB, nu încape în localStorage) ---------- */
+const audioDB = new Promise((res, rej) => {
+  try {
+    const r = indexedDB.open('organizator-audio', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('clips');
+    r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+  } catch (e) { rej(e); }
+});
+async function audioOp(mode, fn) {
+  const d = await audioDB;
+  return new Promise((res, rej) => {
+    const tx = d.transaction('clips', mode); const req = fn(tx.objectStore('clips'));
+    tx.oncomplete = () => res(req && req.result); tx.onerror = () => rej(tx.error);
+  });
+}
+const audioPut = (id, blob) => audioOp('readwrite', s => s.put(blob, id));
+const audioGet = id => audioOp('readonly', s => s.get(id));
+const audioDel = id => audioOp('readwrite', s => s.delete(id)).catch(() => {});
+const audioClear = () => audioOp('readwrite', s => s.clear()).catch(() => {});
+const blobToDataURL = b => new Promise(r => { const f = new FileReader(); f.onload = () => r(f.result); f.readAsDataURL(b); });
+const dataURLToBlob = u => fetch(u).then(r => r.blob());
+const fmtDur = s => `${Math.floor(s / 60)}:${pad(Math.floor(s % 60))}`;
+
+/* ---------- înregistrare vocală ---------- */
+function voiceRecorder() {
+  if (!navigator.mediaDevices || !window.MediaRecorder)
+    return toast('Telefonul nu permite înregistrarea aici. Actualizează iOS.');
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  let rec, stream, chunks = [], t0, timer, recog, transcript = '', interim = '', stopped = false, cancelled = false;
+  openSheet(`${head('Notă vocală', '')}
+    <div class="rec">
+      <div class="time" id="r-time">0:00</div>
+      <button class="big" id="r-btn" aria-label="Înregistrează"><i></i></button>
+      <div class="hint" id="r-hint">Apasă butonul roșu ca să începi.</div>
+      ${SR ? '<div class="live" id="r-live">Textul vorbit apare aici…</div>' : ''}
+    </div>`, sh => {
+    sh.querySelector('[data-close]').onclick = () => { cancelled = true; cleanup(); closeSheet(); };
+    $('#r-btn').onclick = () => rec && rec.state === 'recording' ? stop() : start();
+  });
+  function cleanup() {
+    stopped = true; clearInterval(timer);
+    try { recog && recog.stop(); } catch {}
+    try { rec && rec.state !== 'inactive' && rec.stop(); } catch {}
+    stream && stream.getTracks().forEach(t => t.stop());
+  }
+  async function start() {
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+    catch { return toast('Permite accesul la microfon din Setări'); }
+    rec = new MediaRecorder(stream); chunks = [];
+    rec.ondataavailable = e => e.data.size && chunks.push(e.data);
+    rec.onstop = saveClip;
+    rec.start(1000); t0 = Date.now();
+    $('#r-btn').classList.add('on'); $('#r-hint').textContent = 'Înregistrez… apasă din nou ca să oprești și să salvezi.';
+    timer = setInterval(() => { const el = $('#r-time'); if (el) el.textContent = fmtDur((Date.now() - t0) / 1000); }, 250);
+    if (SR) {
+      try {
+        recog = new SR(); recog.lang = 'ro-RO'; recog.continuous = true; recog.interimResults = true;
+        recog.onresult = e => {
+          interim = '';
+          for (let i = e.resultIndex; i < e.results.length; i++) {
+            const r = e.results[i];
+            if (r.isFinal) transcript += r[0].transcript.trim() + ' '; else interim += r[0].transcript;
+          }
+          const el = $('#r-live'); if (el) el.textContent = (transcript + interim).trim() || '…';
+        };
+        recog.onend = () => { if (!stopped && rec && rec.state === 'recording') try { recog.start(); } catch {} };
+        recog.onerror = () => {};
+        recog.start();
+      } catch { recog = null; }
+    }
+  }
+  function stop() { $('#r-hint').textContent = 'Salvez…'; const dur = (Date.now() - t0) / 1000; stop.dur = dur; cleanup(); }
+  async function saveClip() {
+    if (cancelled) return;
+    const type = (chunks[0] && chunks[0].type) || rec.mimeType || 'audio/mp4';
+    const blob = new Blob(chunks, { type }); if (!blob.size) { closeSheet(); return toast('Înregistrarea e goală'); }
+    const id = uid(); const now = new Date();
+    try { await audioPut(id, blob); } catch { closeSheet(); return toast('Nu am putut salva sunetul'); }
+    const text = (transcript + interim).trim();
+    db.notes.push({ id: uid(), title: text ? text.slice(0, 40) : `Notă vocală ${now.getDate()} ${MONTHS[now.getMonth()].slice(0, 3)}, ${pad(now.getHours())}:${pad(now.getMinutes())}`,
+      body: text, cat: 'Personal', updated: Date.now(), audio: id, dur: Math.round(stop.dur || 0) });
+    save(); closeSheet(); if (view !== 'notes') go('notes'); else render(); toast('Notă vocală salvată 🎤');
+  }
+}
+$('#voiceBtn').onclick = voiceRecorder;
+
 /* ---------- NOTIȚE ---------- */
 function noteForm(n = {}) {
   const isNew = !n.id;
   openSheet(`${head(isNew ? 'Notiță nouă' : 'Notiță')}
     <input id="f-title" value="${esc(n.title)}" placeholder="Titlu" style="font-weight:600">
+    ${n.audio ? '<audio id="f-audio" controls preload="metadata"></audio>' : ''}
     <label>Categorie</label><select id="f-cat">${opts(NOTE_CATS, n.cat || 'Personal')}</select>
     <label>Text</label><textarea id="f-body" placeholder="Scrie aici…">${esc(n.body)}</textarea>
     ${isNew ? '' : `<div class="hint">Modificată: ${new Date(n.updated).toLocaleString('ro-RO')}</div>
@@ -424,8 +529,12 @@ function noteForm(n = {}) {
       if (isNew) db.notes.push({ id: uid(), ...data }); else Object.assign(n, data);
       save(); closeSheet(); render(); toast('Salvat');
     });
+    if (n.audio) audioGet(n.audio).then(b => {
+      const a = $('#f-audio'); if (!a) return;
+      if (b) { a.src = URL.createObjectURL(b); } else a.outerHTML = '<div class="hint">Sunetul nu mai există pe acest telefon.</div>';
+    }).catch(() => {});
     if (!isNew) {
-      $('#f-del').onclick = () => { if (confirm('Ștergi notița?')) { db.notes = db.notes.filter(x => x !== n); save(); closeSheet(); render(); } };
+      $('#f-del').onclick = () => { if (confirm('Ștergi notița?')) { if (n.audio) audioDel(n.audio); db.notes = db.notes.filter(x => x !== n); save(); closeSheet(); render(); } };
       $('#f-share').onclick = async () => {
         const text = `${n.title}\n\n${n.body}`;
         try { if (navigator.share) await navigator.share({ title: n.title, text }); else { await navigator.clipboard.writeText(text); toast('Copiat'); } } catch {}
@@ -439,7 +548,7 @@ function renderNotes() {
   const q = $('#noteSearch').value.trim().toLowerCase();
   const list = db.notes.filter(n => !q || (n.title + ' ' + n.body + ' ' + n.cat).toLowerCase().includes(q)).sort((a, b) => b.updated - a.updated);
   $('#noteList').innerHTML = list.map(n => `<div class="note" data-note="${n.id}"><div class="t">${esc(n.title)}</div>
-    <div class="b">${esc(n.body)}</div><div class="c"><span class="pill">${esc(n.cat)}</span></div></div>`).join('') ||
+    <div class="b">${esc(n.body)}</div><div class="c">${n.audio ? `<span class="pill red">🎤 ${fmtDur(n.dur || 0)}</span> ` : ''}<span class="pill">${esc(n.cat)}</span></div></div>`).join('') ||
     `<div class="empty" style="grid-column:1/-1">${q ? 'Nimic găsit.' : 'Nicio notiță. Apasă + ca să scrii una.'}</div>`;
 }
 $('#noteList').addEventListener('click', e => {
@@ -531,11 +640,12 @@ $('#fab').onclick = () => {
     <button class="btn" data-add="ev">📅 Programare</button>
     <button class="btn" data-add="task">✅ Sarcină</button>
     <button class="btn" data-add="note">📝 Notiță</button>
+    <button class="btn" data-add="voice">🎤 Notă vocală</button>
     <button class="btn" data-add="money">💸 Cheltuială / venit</button>`, sh => {
     bind(sh);
     sh.addEventListener('click', e => {
       const b = e.target.closest('[data-add]'); if (!b) return;
-      ({ ev: () => eventForm(), task: () => taskForm(), note: () => noteForm(), money: () => moneyForm() })[b.dataset.add]();
+      ({ ev: () => eventForm(), task: () => taskForm(), note: () => noteForm(), voice: () => voiceRecorder(), money: () => moneyForm() })[b.dataset.add]();
     });
   });
 };
@@ -562,7 +672,9 @@ $('#settingsBtn').onclick = () => {
     let last; try { last = localStorage.getItem('organizator-backup'); } catch {}
     $('#s-last').textContent = last ? 'Ultimul backup: ' + new Date(+last).toLocaleString('ro-RO') : 'Nu ai făcut încă niciun backup.';
     $('#s-export').onclick = async () => {
-      const json = JSON.stringify({ app: 'organizator', version: 1, saved: new Date().toISOString(), data: db }, null, 1);
+      const audio = {};
+      for (const n of db.notes) if (n.audio) { try { const b = await audioGet(n.audio); if (b) audio[n.audio] = await blobToDataURL(b); } catch {} }
+      const json = JSON.stringify({ app: 'organizator', version: 2, saved: new Date().toISOString(), data: db, audio });
       const name = `organizator-backup-${todayISO()}.json`;
       const file = new File([json], name, { type: 'application/json' });
       try {
@@ -579,12 +691,14 @@ $('#settingsBtn').onclick = () => {
         const obj = JSON.parse(await f.text()); const d = obj.data || obj;
         if (!Array.isArray(d.events) || !Array.isArray(d.tasks)) throw 0;
         if (!confirm('Înlocuiești datele actuale cu cele din backup?')) return;
-        db = Object.assign(structuredClone(EMPTY), d); save(); closeSheet(); render(); toast('Restaurat');
+        db = Object.assign(structuredClone(EMPTY), d); save();
+        for (const [id, url] of Object.entries(obj.audio || {})) { try { await audioPut(id, await dataURLToBlob(url)); } catch {} }
+        closeSheet(); render(); toast('Restaurat');
       } catch { toast('Fișier de backup invalid'); }
     };
     $('#s-clean').onclick = () => { const n = db.tasks.filter(t => t.done).length; db.tasks = db.tasks.filter(t => !t.done); save(); render(); toast(`Șterse ${n} sarcini`); closeSheet(); };
     $('#s-wipe').onclick = () => {
-      if (confirm('Sigur ștergi TOATE datele? Nu se poate anula.') && confirm('Ultima confirmare: ștergi tot?')) { db = structuredClone(EMPTY); save(); closeSheet(); render(); }
+      if (confirm('Sigur ștergi TOATE datele? Nu se poate anula.') && confirm('Ultima confirmare: ștergi tot?')) { db = structuredClone(EMPTY); save(); audioClear(); closeSheet(); render(); }
     };
   });
 };
